@@ -30,7 +30,7 @@ library(stringr)
 REDCAP_URL   <- Sys.getenv("REDCAP_URL",   unset = "https://utirc.mak.ac.ug:8181/api/")
 REDCAP_TOKEN <- Sys.getenv("REDCAP_TOKEN", unset = "DB3A6783D453629A94F96AE06C799A45")
 
-REFRESH_SECONDS <- 60  # how often the dashboard re-polls REDCap
+REFRESH_SECONDS <- 1800  # how often the dashboard re-polls REDCap
 
 # ------------------------------------------------------------------------------
 # Fetch ALL records from REDCap (flat export, labeled values)
