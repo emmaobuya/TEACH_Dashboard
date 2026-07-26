@@ -329,7 +329,7 @@ server <- function(input, output, session) {
 
     by_facility <- by_facility %>%
       left_join(m2_by_facility, by = "facility") %>%
-      left_join(m6_by_facility, by = "facility") %>%
+      left_join(m5_by_facility, by = "facility") %>%
       mutate(across(c(`Month 2 SBQ Done`, `Month 5 SBQ Done`), ~ replace(., is.na(.), 0))) %>%
       arrange(desc(`Cascade Step 1 Screened`))
 
