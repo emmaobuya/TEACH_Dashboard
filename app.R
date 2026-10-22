@@ -1,14 +1,12 @@
 # ==============================================================================
-# TEACH Recruitment Dashboard (LIVE) -- initial screens
+# TEACH Recruitment Dashboard (LIVE)
 # ==============================================================================
-# Screens built so far: Home, Recruitment Cascade, Recruitment Cascade Table,
-# By Health Facility. Trend over time / Missing Consent / List come next,
-# once their DAX/measure definitions are confirmed.
+# BEFORE RUNNING: open redcap_connect.R and check REDCAP_URL / REDCAP_TOKEN.
 #
-# BEFORE RUNNING: open redcap_connect.R and set REDCAP_TOKEN to your API
-# token. REDCAP_URL is already set to https://utirc.mak.ac.ug:8181/api/
-# (per your Power Query script) -- double check that's the right host before
-# going live, since it differs from the one you gave me earlier.
+# CHANGE LOG (Oct 2026):
+#   - Missing Forms tab: reference date is now tbrx_start_date for all forms.
+#   - TEACH Outcomes forms use scheduled due dates (see redcap_connect.R).
+#   - "Total Missing" counts exclude "Not yet Due" rows.
 # ==============================================================================
 
 library(shiny)
@@ -29,7 +27,6 @@ CASCADE_STEPS <- c(
   "Cascade Step 5 SBQ Done"
 )
 
-# One row per participant -> named vector of cascade step counts
 compute_cascade_counts <- function(df) {
   c(
     "Cascade Step 1 Screened"  = sum(df$screening_form_complete == "Complete", na.rm = TRUE),
@@ -38,6 +35,16 @@ compute_cascade_counts <- function(df) {
     "Cascade Step 4 Enrolled"  = sum(df$enrollment_form_complete == "Complete", na.rm = TRUE),
     "Cascade Step 5 SBQ Done"  = sum(df$sbq_form_complete == "Complete", na.rm = TRUE)
   )
+}
+
+# Count of rows that are actually missing (i.e. not "Not yet Due")
+count_missing <- function(df) {
+  if (nrow(df) == 0) return(0L)
+  sum(!(df$status %in% NOT_MISSING_STATUSES))
+}
+count_not_yet_due <- function(df) {
+  if (nrow(df) == 0) return(0L)
+  sum(df$status %in% NOT_MISSING_STATUSES)
 }
 
 # ------------------------------------------------------------------------------
@@ -126,12 +133,15 @@ ui <- page_navbar(
   nav_panel(
     "Missing Forms",
     p(class = "text-muted small",
-      "Uses the Facility and Screening Date Range filters in the sidebar (based on each participant's screening date), plus the Form and Status filters below."),
+      "Uses the Facility and Screening Date Range filters in the sidebar, plus the Form and Status filters below. ",
+      "All forms are measured from tbrx_start_date. Total Missing excludes forms that are Not yet Due."),
     layout_columns(
       col_widths = c(3, 3, 3, 3),
       selectInput("mf_form", "Form", choices = c("All", STAGE1_FORMS), selected = "All"),
       selectInput("mf_status", "Status", choices = c("All", ALL_STATUSES), selected = "All"),
-      value_box(title = "Total Missing Forms", value = textOutput("mf_total"), showcase = icon("list-check")),
+      value_box(title = "Total Missing Forms", value = textOutput("mf_total"),
+                p(class = "small mb-0", textOutput("mf_notyet", inline = TRUE)),
+                showcase = icon("list-check")),
       value_box(title = "Overdue", value = textOutput("mf_overdue_total"), showcase = icon("triangle-exclamation"), theme = "danger")
     ),
     card(
@@ -143,13 +153,18 @@ ui <- page_navbar(
   nav_panel(
     "Missing TEACH Outcomes",
     p(class = "text-muted small",
-      "Uses the Facility and Screening Date Range filters in the sidebar, plus the Form, Status, and TB Meds filters below. Lab / TB Treatment / ART Refill all apply only to eligible, consented, enrolled participants (ART Refill additionally requires HIV positive + on ART), and are all measured from tbrx_start_date."),
+      "Uses the Facility and Screening Date Range filters in the sidebar, plus the filters below. ",
+      "Each form has a due date counted from tbrx_start_date (TB refill: start of each period, e.g. 5-6 weeks is due at 5 weeks; ",
+      "Lab: Month 2 and Month 5; ART: monthly). Before the due date a form is Not yet Due; after it, ",
+      "Due (0-14 days past due), Almost Overdue (15-30) and Overdue (>30). Total Missing excludes Not yet Due."),
     layout_columns(
       col_widths = c(3, 3, 3, 3),
       selectInput("mo_form", "Form", choices = c("All", STAGE2_FORMS), selected = "All"),
       selectInput("mo_status", "Status", choices = c("All", STAGE2_STATUSES), selected = "All"),
       selectInput("mo_tbmeds", "Issue of TB Meds (TB Treatment only)", choices = c("All", TB_MEDS_CHOICES), selected = "All"),
-      value_box(title = "Total Missing", value = textOutput("mo_total"), showcase = icon("list-check"))
+      value_box(title = "Total Missing", value = textOutput("mo_total"),
+                p(class = "small mb-0", textOutput("mo_notyet", inline = TRUE)),
+                showcase = icon("list-check"))
     ),
     card(
       card_header("Missing TEACH Outcomes line list"),
@@ -200,6 +215,7 @@ server <- function(input, output, session) {
     df
   })
 
+
   # ---- Home tab header ----
   output$header_line <- renderText({
     d <- live_data()
@@ -208,7 +224,6 @@ server <- function(input, output, session) {
   })
 
   # ---- Home KPIs ----
-  # Shared computation of every Home-page KPI, keyed for reuse below
   current_kpis <- reactive({
     df <- baseline_filtered()
     m2 <- live_data()$month2_sbq
@@ -230,41 +245,36 @@ server <- function(input, output, session) {
     )
   })
 
-  # Static classification: does this card represent forward progress
-  # (green/"success") or a dropout/gap in the cascade (red/"danger")?
-  # This is fixed per card, not based on trend over time.
   kpi_color <- list(
     screened             = "success",
     consent_missing      = "danger",
     eligible             = "success",
-    ineligible            = "danger",
-    consent_yes           = "success",
-    consent_no             = "danger",
-    enrolled                = "success",
-    sbq_baseline             = "success",
-    sbq_baseline_missing      = "danger",
-    sbq_m2                     = "success",
-    sbq_m5                      = "success"
+    ineligible           = "danger",
+    consent_yes          = "success",
+    consent_no           = "danger",
+    enrolled             = "success",
+    sbq_baseline         = "success",
+    sbq_baseline_missing = "danger",
+    sbq_m2               = "success",
+    sbq_m5               = "success"
   )
 
   kpi_meta <- list(
     screened             = list(title = "Notified from the Register",   icon = "clipboard-check"),
     consent_missing      = list(title = "Waiting to Consent",           icon = "hourglass-half"),
-    eligible              = list(title = "Eligible from Screening",      icon = "circle-check"),
-    ineligible             = list(title = "Ineligible from Screening",    icon = "circle-xmark"),
-    consent_yes           = list(title = "Consented Yes",                 icon = "signature"),
-    consent_no            = list(title = "Consented No",                  icon = "ban"),
-    enrolled               = list(title = "Enrollment Completed",          icon = "user-plus"),
-    sbq_baseline           = list(title = "Baseline SBQ Completed",        icon = "list-check"),
-    sbq_baseline_missing   = list(title = "Baseline SBQ NOT Completed",    icon = "hourglass-half"),
-    sbq_m2                  = list(title = "SBQ Completed Month 2",         icon = "calendar-check"),
-    sbq_m5                  = list(title = "SBQ Completed Month 5",         icon = "calendar-check")
+    eligible             = list(title = "Eligible from Screening",      icon = "circle-check"),
+    ineligible           = list(title = "Ineligible from Screening",    icon = "circle-xmark"),
+    consent_yes          = list(title = "Consented Yes",                icon = "signature"),
+    consent_no           = list(title = "Consented No",                 icon = "ban"),
+    enrolled             = list(title = "Enrollment Completed",         icon = "user-plus"),
+    sbq_baseline         = list(title = "Baseline SBQ Completed",       icon = "list-check"),
+    sbq_baseline_missing = list(title = "Baseline SBQ NOT Completed",   icon = "hourglass-half"),
+    sbq_m2               = list(title = "SBQ Completed Month 2",        icon = "calendar-check"),
+    sbq_m5               = list(title = "SBQ Completed Month 5",        icon = "calendar-check")
   )
 
-  # Builds one color-coded value_box for a given KPI key
   render_kpi_box <- function(key) {
-    force(key)  # lock in this card's key now -- without this, all cards
-                # would lazily resolve to whichever key the loop ends on
+    force(key)
     renderUI({
       val <- current_kpis()[[key]]
       meta <- kpi_meta[[key]]
@@ -307,14 +317,10 @@ server <- function(input, output, session) {
         `Cascade Step 2 Eligible`  = sum(eligibility_status == "Yes", na.rm = TRUE),
         `Cascade Step 3 Consented` = sum(consent == "Yes", na.rm = TRUE),
         `Cascade Step 4 Enrolled`  = sum(enrollment_form_complete == "Complete", na.rm = TRUE),
-        `Baseline SBQ Done`       = sum(sbq_form_complete == "Complete", na.rm = TRUE),
+        `Baseline SBQ Done`        = sum(sbq_form_complete == "Complete", na.rm = TRUE),
         .groups = "drop"
       )
 
-    # Month 2 / Month 5 SBQ completion live in separate REDCap events, so we
-    # join them back to the (filtered) participant list by study_id to get
-    # their facility, then count per facility -- same pattern as the Home
-    # page's SBQ Month 2/6 cards.
     ids_facility <- df %>% select(study_id, facility)
 
     m2_by_facility <- live_data()$month2_sbq %>%
@@ -343,8 +349,7 @@ server <- function(input, output, session) {
     datatable(out, options = list(pageLength = 15, scrollX = TRUE), rownames = FALSE)
   })
 
-  # ---- By Health Facility tab ----
-  # Enrolled = eligible + consented Yes + enrollment form Complete
+  # ---- By Health Facility tabs ----
   enrolled_filtered <- reactive({
     df <- baseline_filtered()
     if (nrow(df) == 0) return(df)
@@ -355,11 +360,6 @@ server <- function(input, output, session) {
     )
   })
 
-  # The full set of facilities that should appear on the axis -- either all
-  # facilities in the system, or just the one selected in the sidebar filter.
-  # Using this (rather than only facilities present in the enrolled subset)
-  # is what makes facilities with zero enrolled participants still show up
-  # as a zero-height bar instead of disappearing from the chart entirely.
   facility_universe <- reactive({
     all_f <- sort(unique(na.omit(live_data()$baseline$facility)))
     if (input$f_facility != "All") intersect(all_f, input$f_facility) else all_f
@@ -424,11 +424,6 @@ server <- function(input, output, session) {
   })
 
   # ---- Missing Forms tab ----
-  # Scoped to the same participants as the sidebar's Facility + Screening
-  # Date Range filters (via baseline_filtered()'s study_ids), even though
-  # each missing-form row's own "days since" reference date differs by form
-  # type (screening/consent/enrollment date) -- the sidebar filters describe
-  # WHO is in scope, not which date column to filter each row on.
   missing_forms_scoped <- reactive({
     mf <- live_data()$missing_forms
     ids <- baseline_filtered()$study_id
@@ -445,7 +440,11 @@ server <- function(input, output, session) {
   })
 
   output$mf_total <- renderText({
-    format(nrow(missing_forms_filtered()), big.mark = ",")
+    format(count_missing(missing_forms_filtered()), big.mark = ",")
+  })
+
+  output$mf_notyet <- renderText({
+    paste0("Not yet due (excluded): ", format(count_not_yet_due(missing_forms_filtered()), big.mark = ","))
   })
 
   output$mf_overdue_total <- renderText({
@@ -466,7 +465,7 @@ server <- function(input, output, session) {
         `Study ID` = study_id,
         Facility = facility,
         Form = form,
-        `Reference Date` = format(reference_date, "%d %b %Y"),
+        `Reference Date (tbrx_start_date)` = format(reference_date, "%d %b %Y"),
         `Days Since` = round(days_since),
         Status = status
       )
@@ -498,7 +497,11 @@ server <- function(input, output, session) {
   })
 
   output$mo_total <- renderText({
-    format(nrow(missing_outcomes_filtered()), big.mark = ",")
+    format(count_missing(missing_outcomes_filtered()), big.mark = ",")
+  })
+
+  output$mo_notyet <- renderText({
+    paste0("Not yet due (excluded): ", format(count_not_yet_due(missing_outcomes_filtered()), big.mark = ","))
   })
 
   output$missing_outcomes_table <- renderDT({
@@ -508,15 +511,17 @@ server <- function(input, output, session) {
     }
 
     out <- df %>%
-      arrange(form, desc(days_since)) %>%
+      arrange(form, desc(days_past_due)) %>%
       transmute(
         `Study ID` = study_id,
         Facility = facility,
         Form = form,
+        `Expected At` = expected_at,
         `Reference Date (tbrx_start_date)` = format(reference_date, "%d %b %Y"),
-        `Days Since` = round(days_since),
-        Status = status,
-        `Issue of TB Meds (Missing)` = ifelse(is.na(issue_of_tb_meds), "--", issue_of_tb_meds)
+        `Due Date` = format(due_date, "%d %b %Y"),
+        `Days Since TB Rx Start` = round(days_since),
+        `Days Past Due` = round(days_past_due),
+        Status = status
       )
 
     datatable(out, options = list(pageLength = 20, scrollX = TRUE), rownames = FALSE) %>%
