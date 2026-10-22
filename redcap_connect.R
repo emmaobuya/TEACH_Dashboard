@@ -21,8 +21,8 @@
 #     each expected form gets a DUE DATE counted from tbrx_start_date. Before
 #     that date the form is "Not yet Due"; after it, Due / Almost Overdue /
 #     Overdue are counted from the due date (0-14 / 15-30 / >30 days).
-#   - Missing Forms (Consent through Month 5 SBQ) now use tbrx_start_date as
-#     the reference date for days-since and status, same as TEACH Outcomes.
+#   - Every line-list row now carries tbrx_start_date so the Missing Forms
+#     screens can be filtered on treatment start date.
 # ==============================================================================
 
 library(curl)
@@ -406,12 +406,11 @@ build_scheduled_missing <- function(base, schedule, completed_pairs, form_label)
 # ------------------------------------------------------------------------------
 # Missing Form line list
 # ------------------------------------------------------------------------------
-#  1. Consent      -- eligible & consent blank.
-#  2. Enrollment    -- eligible & consent=Yes & enrollment not Complete.
-#  3. Baseline SBQ  -- eligible & consent=Yes & baseline SBQ not Complete.
-#  4. Month 2 SBQ   -- enrolled & baseline SBQ Complete & Month 2 SBQ not Complete.
+#  1. Consent      -- eligible & consent blank.        Days since screening.
+#  2. Enrollment    -- eligible & consent=Yes & enrollment not Complete. Days since consent.
+#  3. Baseline SBQ  -- eligible & consent=Yes & baseline SBQ not Complete. Days since consent.
+#  4. Month 2 SBQ   -- enrolled & baseline SBQ Complete & Month 2 SBQ not Complete. Days since enrollment.
 #  5. Month 5 SBQ   -- same, for the Month 5 ("Month_Six_followup") event.
-#  All five: reference date = tbrx_start_date, days since = calc_days_since_tbrx.
 #  6-8. Lab / TB Treatment / ART Refill -- scheduled from tbrx_start_date
 #       (see the schedules above).
 # ------------------------------------------------------------------------------
@@ -433,24 +432,24 @@ build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
   consent_missing <- baseline %>%
     filter(eligibility_status == "Yes", is.na(consent)) %>%
     transmute(study_id, facility, form = "Consent",
-              reference_date = tbrx_start_date,
-              days_since = calc_days_since_tbrx,
+              reference_date = screening_date,
+              days_since = calc_days_since_screening,
               status = classify_3tier(days_since))
 
   enrollment_missing <- baseline %>%
     filter(eligibility_status == "Yes", consent == "Yes",
            is.na(enrollment_form_complete) | enrollment_form_complete != "Complete") %>%
     transmute(study_id, facility, form = "Enrollment",
-              reference_date = tbrx_start_date,
-              days_since = calc_days_since_tbrx,
+              reference_date = date_of_consent,
+              days_since = calc_days_since_consent,
               status = classify_3tier(days_since))
 
   baseline_sbq_missing <- baseline %>%
     filter(eligibility_status == "Yes", consent == "Yes",
            is.na(sbq_form_complete) | sbq_form_complete != "Complete") %>%
     transmute(study_id, facility, form = "Baseline SBQ",
-              reference_date = tbrx_start_date,
-              days_since = calc_days_since_tbrx,
+              reference_date = date_of_consent,
+              days_since = calc_days_since_consent,
               status = classify_3tier(days_since))
 
   month2_missing <- baseline %>%
@@ -459,8 +458,8 @@ build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
            sbq_form_complete == "Complete",
            !(study_id %in% m2_complete_ids)) %>%
     transmute(study_id, facility, form = "Month 2 SBQ",
-              reference_date = tbrx_start_date,
-              days_since = calc_days_since_tbrx,
+              reference_date = date_of_enrollment,
+              days_since = calc_days_since_enrollment,
               status = classify_month2(days_since))
 
   month5_missing <- baseline %>%
@@ -469,8 +468,8 @@ build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
            sbq_form_complete == "Complete",
            !(study_id %in% m5_complete_ids)) %>%
     transmute(study_id, facility, form = "Month 5 SBQ",
-              reference_date = tbrx_start_date,
-              days_since = calc_days_since_tbrx,
+              reference_date = date_of_enrollment,
+              days_since = calc_days_since_enrollment,
               status = classify_month5(days_since))
 
   # ---- TEACH Outcomes forms (scheduled from tbrx_start_date) ----
