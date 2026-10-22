@@ -4,7 +4,8 @@
 # BEFORE RUNNING: open redcap_connect.R and check REDCAP_URL / REDCAP_TOKEN.
 #
 # CHANGE LOG (Oct 2026):
-#   - Missing Forms tab: reference date is now tbrx_start_date for all forms.
+#   - Missing Forms + Missing TEACH Outcomes tabs are now filtered by a
+#     Treatment Start Date (tbrx_start_date) range instead of screening date.
 #   - TEACH Outcomes forms use scheduled due dates (see redcap_connect.R).
 #   - "Total Missing" counts exclude "Not yet Due" rows.
 # ==============================================================================
@@ -61,6 +62,13 @@ ui <- page_navbar(
     selectInput("f_facility", "Facility", choices = c("All"), selected = "All"),
     dateRangeInput("f_daterange", "Screening Date Range",
                     start = Sys.Date() - 365, end = Sys.Date()),
+    p(class = "text-muted small mt-n2",
+      "Applies to Home, Cascade and Enrolled tabs."),
+    dateRangeInput("f_tbrx_range", "Treatment Start Date Range (tbrx_start_date)",
+                    start = Sys.Date() - 730, end = Sys.Date()),
+    checkboxInput("f_tbrx_include_na", "Include participants with no treatment start date", value = TRUE),
+    p(class = "text-muted small mt-n2",
+      "Applies to Missing Forms and Missing TEACH Outcomes tabs."),
     hr(),
     textOutput("connection_status"),
     p(class = "text-muted small",
@@ -133,8 +141,8 @@ ui <- page_navbar(
   nav_panel(
     "Missing Forms",
     p(class = "text-muted small",
-      "Uses the Facility and Screening Date Range filters in the sidebar, plus the Form and Status filters below. ",
-      "All forms are measured from tbrx_start_date. Total Missing excludes forms that are Not yet Due."),
+      "Uses the Facility and Treatment Start Date Range filters in the sidebar, plus the Form and Status filters below. ",
+      "Total Missing excludes forms that are Not yet Due."),
     layout_columns(
       col_widths = c(3, 3, 3, 3),
       selectInput("mf_form", "Form", choices = c("All", STAGE1_FORMS), selected = "All"),
@@ -153,7 +161,7 @@ ui <- page_navbar(
   nav_panel(
     "Missing TEACH Outcomes",
     p(class = "text-muted small",
-      "Uses the Facility and Screening Date Range filters in the sidebar, plus the filters below. ",
+      "Uses the Facility and Treatment Start Date Range filters in the sidebar, plus the filters below. ",
       "Each form has a due date counted from tbrx_start_date (TB refill: start of each period, e.g. 5-6 weeks is due at 5 weeks; ",
       "Lab: Month 2 and Month 5; ART: monthly). Before the due date a form is Not yet Due; after it, ",
       "Due (0-14 days past due), Almost Overdue (15-30) and Overdue (>30). Total Missing excludes Not yet Due."),
@@ -205,6 +213,14 @@ server <- function(input, output, session) {
                             start = min(valid_dates), end = max(valid_dates),
                             min = min(valid_dates), max = max(valid_dates))
     }
+
+    valid_tbrx <- na.omit(df$tbrx_start_date)
+    if (length(valid_tbrx) > 0) {
+      # end at today (or later) so newly enrolled participants aren't cut off
+      updateDateRangeInput(session, "f_tbrx_range",
+                            start = min(valid_tbrx),
+                            end = max(max(valid_tbrx), Sys.Date()))
+    }
   }, once = TRUE)
 
   baseline_filtered <- reactive({
@@ -215,6 +231,18 @@ server <- function(input, output, session) {
     df
   })
 
+  # Participants in scope for the two Missing tabs: Facility filter +
+  # Treatment Start Date Range (tbrx_start_date), NOT screening date.
+  missing_scope_ids <- reactive({
+    df <- live_data()$baseline
+    if (nrow(df) == 0) return(character(0))
+    if (input$f_facility != "All") df <- df %>% filter(facility == input$f_facility)
+    rng <- input$f_tbrx_range
+    in_range <- !is.na(df$tbrx_start_date) &
+      df$tbrx_start_date >= rng[1] & df$tbrx_start_date <= rng[2]
+    keep <- in_range | (isTRUE(input$f_tbrx_include_na) & is.na(df$tbrx_start_date))
+    df$study_id[keep]
+  })
 
   # ---- Home tab header ----
   output$header_line <- renderText({
@@ -426,7 +454,7 @@ server <- function(input, output, session) {
   # ---- Missing Forms tab ----
   missing_forms_scoped <- reactive({
     mf <- live_data()$missing_forms
-    ids <- baseline_filtered()$study_id
+    ids <- missing_scope_ids()
     if (nrow(mf) == 0 || length(ids) == 0) return(mf[0, ])
     mf %>% filter(study_id %in% ids, form %in% STAGE1_FORMS)
   })
@@ -465,7 +493,8 @@ server <- function(input, output, session) {
         `Study ID` = study_id,
         Facility = facility,
         Form = form,
-        `Reference Date (tbrx_start_date)` = format(reference_date, "%d %b %Y"),
+        `TB Rx Start Date` = format(tbrx_start_date, "%d %b %Y"),
+        `Reference Date` = format(reference_date, "%d %b %Y"),
         `Days Since` = round(days_since),
         Status = status
       )
@@ -482,7 +511,7 @@ server <- function(input, output, session) {
   # ---- Missing TEACH Outcomes tab ----
   missing_outcomes_scoped <- reactive({
     mf <- live_data()$missing_forms
-    ids <- baseline_filtered()$study_id
+    ids <- missing_scope_ids()
     if (nrow(mf) == 0 || length(ids) == 0) return(mf[0, ])
     mf %>% filter(study_id %in% ids, form %in% STAGE2_FORMS)
   })
@@ -517,7 +546,7 @@ server <- function(input, output, session) {
         Facility = facility,
         Form = form,
         `Expected At` = expected_at,
-        `Reference Date (tbrx_start_date)` = format(reference_date, "%d %b %Y"),
+        `TB Rx Start Date` = format(reference_date, "%d %b %Y"),
         `Due Date` = format(due_date, "%d %b %Y"),
         `Days Since TB Rx Start` = round(days_since),
         `Days Past Due` = round(days_past_due),
