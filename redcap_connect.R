@@ -23,6 +23,9 @@
 #     Overdue are counted from the due date (0-14 / 15-30 / >30 days).
 #   - Every line-list row now carries tbrx_start_date so the Missing Forms
 #     screens can be filtered on treatment start date.
+#   - NEW: build_closeout() derives a close-out outcome per participant
+#     (Died / Transferred out / Lost to follow-up / Not consented >30 days).
+#     Missing-form rows carry closeout_outcome so the app can hide them.
 # ==============================================================================
 
 library(curl)
@@ -509,6 +512,180 @@ build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
 }
 
 # ------------------------------------------------------------------------------
+# CLOSE-OUT OUTCOMES
+# ------------------------------------------------------------------------------
+# Participants who should leave the Missing lists because they can no longer
+# be followed up. One row per participant, first matching rule wins:
+#
+#  STEP 1  Died -- death recorded ANYWHERE:
+#            participant_status == "Dead" at Baseline, Month 2 or Month 5 SBQ;
+#            reason_refusal = "Passed on before consent" (or date_of_death_consent
+#            filled); a dod at any SBQ visit; or a TB refill treatment_outcome
+#            of Died.
+#  STEP 3  Transferred out / Lost to follow-up from participant_status,
+#            latest visit first: Month 5, then Month 2, then Baseline.
+#  STEP 4  Transferred out -- transfer_out = "Yes" on ANY TB refill visit
+#            (all refill periods, 1-2 weeks through 12 months).
+#  STEP 5  Transferred out -- reason_refusal says "Transferred out".
+#  STEP 6  Not consented -- eligible, consent blank, >30 days since screening.
+# ------------------------------------------------------------------------------
+
+CLOSEOUT_OUTCOMES <- c("Died", "Transferred out", "Lost to follow-up",
+                       "Not consented (>30 days)")
+
+# Returns a column (blank -> NA) or an all-NA vector if REDCap didn't export it
+col_or_na <- function(df, col) {
+  if (col %in% names(df)) blank_to_na(as.character(df[[col]])) else rep(NA_character_, nrow(df))
+}
+
+first_date <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) as.Date(NA) else min(x)
+}
+
+is_dead   <- function(x) !is.na(x) & str_detect(x, regex("^\\s*dead", ignore_case = TRUE))
+is_ltfu   <- function(x) !is.na(x) & str_detect(x, regex("lost to follow", ignore_case = TRUE))
+is_tout   <- function(x) !is.na(x) & str_detect(x, regex("transferred out", ignore_case = TRUE))
+
+# participant_status + dates from one SBQ event, suffixed _bl / _m2 / _m5
+build_event_participant_status <- function(raw_all, event_name, suffix) {
+  ev <- raw_all %>%
+    filter(redcap_event_name == event_name,
+           is.na(redcap_repeat_instrument) | redcap_repeat_instrument == "")
+  out <- tibble(
+    study_id      = ev$study_id,
+    status        = col_or_na(ev, "participant_status"),
+    dod           = parse_redcap_date(col_or_na(ev, "dod")),
+    date_transfer = parse_redcap_date(col_or_na(ev, "date_transfer")),
+    date_last     = parse_redcap_date(col_or_na(ev, "date_last_visit"))
+  ) %>%
+    distinct(study_id, .keep_all = TRUE)
+  names(out)[-1] <- paste0(names(out)[-1], "_", suffix)
+  out
+}
+
+empty_closeout <- function() {
+  tibble(study_id = character(0), facility = character(0), outcome = character(0),
+         recorded_at = character(0), outcome_date = as.Date(character(0)),
+         screening_date = as.Date(character(0)), tbrx_start_date = as.Date(character(0)))
+}
+
+build_closeout <- function(raw_all, baseline) {
+  if (nrow(raw_all) == 0 || nrow(baseline) == 0) return(empty_closeout())
+
+  bl <- tibble(
+    study_id              = baseline$study_id,
+    facility              = baseline$facility,
+    screening_date        = baseline$screening_date,
+    tbrx_start_date       = baseline$tbrx_start_date,
+    eligibility_status    = baseline$eligibility_status,
+    consent               = baseline$consent,
+    days_since_screening  = baseline$calc_days_since_screening,
+    reason_refusal        = col_or_na(baseline, "reason_refusal"),
+    date_death_consent    = parse_redcap_date(col_or_na(baseline, "date_of_death_consent"))
+  )
+
+  st_bl <- build_event_participant_status(raw_all, "1. Baseline", "bl")
+  st_m2 <- build_event_participant_status(raw_all, "2. Month_Two_followup", "m2")
+  st_m5 <- build_event_participant_status(raw_all, "3. Month_Six_followup", "m5")
+
+  # TB refill visits: transfer_out and treatment_outcome, any period
+  tb <- raw_all %>% filter(redcap_repeat_instrument == "Form 6: TB Medication Refill Form")
+  tb <- tibble(
+    study_id          = tb$study_id,
+    period            = col_or_na(tb, "issue_of_tb_meds"),
+    transfer_out      = col_or_na(tb, "transfer_out"),
+    date_transfer_out = parse_redcap_date(col_or_na(tb, "date_of_transfer_out")),
+    treatment_outcome = col_or_na(tb, "treatment_outcome"),
+    date_outcome      = parse_redcap_date(col_or_na(tb, "date_treatment_outcome"))
+  )
+  tb_transfer <- tb %>%
+    filter(!is.na(transfer_out), transfer_out == "Yes") %>%
+    group_by(study_id) %>%
+    summarise(tb_transfer = TRUE,
+              tb_transfer_date = first_date(date_transfer_out),
+              tb_transfer_visit = paste(unique(na.omit(period)), collapse = ", "),
+              .groups = "drop")
+  tb_died <- tb %>%
+    filter(!is.na(treatment_outcome),
+           str_detect(treatment_outcome, regex("died|dead", ignore_case = TRUE))) %>%
+    group_by(study_id) %>%
+    summarise(tb_died = TRUE, tb_died_date = first_date(date_outcome), .groups = "drop")
+
+  d <- bl %>%
+    left_join(st_bl, by = "study_id") %>%
+    left_join(st_m2, by = "study_id") %>%
+    left_join(st_m5, by = "study_id") %>%
+    left_join(tb_transfer, by = "study_id") %>%
+    left_join(tb_died, by = "study_id") %>%
+    mutate(
+      tb_transfer = coalesce(tb_transfer, FALSE),
+      tb_died     = coalesce(tb_died, FALSE),
+
+      # Step 1 pieces
+      died_m5      = is_dead(status_m5) | !is.na(dod_m5),
+      died_m2      = is_dead(status_m2) | !is.na(dod_m2),
+      died_bl      = is_dead(status_bl) | !is.na(dod_bl),
+      died_consent = (!is.na(reason_refusal) &
+                        str_detect(reason_refusal, regex("passed on|died|dead", ignore_case = TRUE))) |
+                     !is.na(date_death_consent),
+
+      # Step 6
+      consent_overdue = !is.na(eligibility_status) & eligibility_status == "Yes" &
+                        is.na(consent) & !is.na(days_since_screening) & days_since_screening > 30,
+
+      outcome = case_when(
+        died_m5 | died_m2 | died_bl | died_consent | tb_died ~ "Died",
+        is_tout(status_m5) ~ "Transferred out",
+        is_ltfu(status_m5) ~ "Lost to follow-up",
+        is_tout(status_m2) ~ "Transferred out",
+        is_ltfu(status_m2) ~ "Lost to follow-up",
+        is_tout(status_bl) ~ "Transferred out",
+        is_ltfu(status_bl) ~ "Lost to follow-up",
+        tb_transfer        ~ "Transferred out",
+        is_tout(reason_refusal) ~ "Transferred out",
+        consent_overdue    ~ "Not consented (>30 days)",
+        TRUE ~ NA_character_
+      ),
+      recorded_at = case_when(
+        died_m5      ~ "Month 5 SBQ",
+        died_m2      ~ "Month 2 SBQ",
+        died_bl      ~ "Baseline SBQ",
+        died_consent ~ "Consent form",
+        tb_died      ~ "TB refill (treatment outcome)",
+        is_tout(status_m5) | is_ltfu(status_m5) ~ "Month 5 SBQ",
+        is_tout(status_m2) | is_ltfu(status_m2) ~ "Month 2 SBQ",
+        is_tout(status_bl) | is_ltfu(status_bl) ~ "Baseline SBQ",
+        tb_transfer        ~ paste0("TB refill (", tb_transfer_visit, ")"),
+        is_tout(reason_refusal) ~ "Consent form",
+        consent_overdue    ~ "Screening (no consent in 30 days)",
+        TRUE ~ NA_character_
+      ),
+      outcome_date = case_when(
+        died_m5      ~ dod_m5,
+        died_m2      ~ dod_m2,
+        died_bl      ~ dod_bl,
+        died_consent ~ date_death_consent,
+        tb_died      ~ tb_died_date,
+        is_tout(status_m5) ~ date_transfer_m5,
+        is_ltfu(status_m5) ~ date_last_m5,
+        is_tout(status_m2) ~ date_transfer_m2,
+        is_ltfu(status_m2) ~ date_last_m2,
+        is_tout(status_bl) ~ date_transfer_bl,
+        is_ltfu(status_bl) ~ date_last_bl,
+        tb_transfer        ~ tb_transfer_date,
+        consent_overdue    ~ screening_date + days(30),
+        TRUE ~ as.Date(NA)
+      )
+    ) %>%
+    filter(!is.na(outcome))
+
+  if (nrow(d) == 0) return(empty_closeout())
+  d %>% select(study_id, facility, outcome, recorded_at, outcome_date,
+               screening_date, tbrx_start_date)
+}
+
+# ------------------------------------------------------------------------------
 # Single entry point app.R calls
 # ------------------------------------------------------------------------------
 load_live_data <- function() {
@@ -522,6 +699,7 @@ load_live_data <- function() {
       month2_sbq = data.frame(),
       month5_sbq = data.frame(),
       missing_forms = data.frame(),
+      closeout = empty_closeout(),
       n_total = 0
     ))
   }
@@ -533,12 +711,19 @@ load_live_data <- function() {
   tb_refill_tbl <- build_tb_refill_status(raw)
   art_refill_tbl <- build_repeat_form_status(raw, "Form 7: ART Medication Refill Form", "art_form_complete")
 
+  closeout_tbl <- build_closeout(raw, baseline_tbl)
+
+  # Tag each missing-form row with the participant's close-out outcome (if any)
+  missing_tbl <- build_missing_form_line_list(baseline_tbl, month2_tbl, month5_tbl,
+                                              lab_tbl, tb_refill_tbl, art_refill_tbl) %>%
+    left_join(closeout_tbl %>% select(study_id, closeout_outcome = outcome), by = "study_id")
+
   list(
     baseline      = baseline_tbl,
     month2_sbq    = month2_tbl,
     month5_sbq    = month5_tbl,
-    missing_forms = build_missing_form_line_list(baseline_tbl, month2_tbl, month5_tbl,
-                                                  lab_tbl, tb_refill_tbl, art_refill_tbl),
+    missing_forms = missing_tbl,
+    closeout      = closeout_tbl,
     n_total       = n_distinct(raw$study_id)
   )
 }
