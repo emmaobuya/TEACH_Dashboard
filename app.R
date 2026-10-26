@@ -8,6 +8,9 @@
 #     Treatment Start Date (tbrx_start_date) range instead of screening date.
 #   - TEACH Outcomes forms use scheduled due dates (see redcap_connect.R).
 #   - "Total Missing" counts exclude "Not yet Due" rows.
+#   - NEW Close-out tab (Died / Transferred out / Lost to follow-up /
+#     Not consented >30 days). Sidebar "Hide closed-out participants" removes
+#     them from both Missing tabs.
 # ==============================================================================
 
 library(shiny)
@@ -67,6 +70,7 @@ ui <- page_navbar(
     dateRangeInput("f_tbrx_range", "Treatment Start Date Range (tbrx_start_date)",
                     start = Sys.Date() - 730, end = Sys.Date()),
     checkboxInput("f_tbrx_include_na", "Include participants with no treatment start date", value = TRUE),
+    checkboxInput("f_hide_closed", "Hide closed-out participants (see Close-out tab)", value = TRUE),
     p(class = "text-muted small mt-n2",
       "Applies to Missing Forms and Missing TEACH Outcomes tabs."),
     hr(),
@@ -178,6 +182,39 @@ ui <- page_navbar(
       card_header("Missing TEACH Outcomes line list"),
       DTOutput("missing_outcomes_table")
     )
+  ),
+
+  nav_panel(
+    "Close-out",
+    p(class = "text-muted small",
+      "Participants who can no longer be followed up. First matching rule wins: ",
+      "(1) Died -- recorded anywhere (Dead at Baseline / Month 2 / Month 5 SBQ, passed on before consent, date of death, TB treatment outcome Died); ",
+      "(2) Transferred out / Lost to follow-up from participant status, latest visit first (Month 5, Month 2, Baseline); ",
+      "(3) Transferred out on any TB refill visit; (4) Transferred out given as reason for not consenting; ",
+      "(5) Not consented -- eligible with no consent 30+ days after screening. ",
+      "Uses the Facility filter only. When 'Hide closed-out participants' is ticked in the sidebar, ",
+      "these participants are removed from both Missing tabs."),
+    layout_columns(
+      col_widths = c(3, 3, 3, 3),
+      uiOutput("co_vb_died"),
+      uiOutput("co_vb_transfer"),
+      uiOutput("co_vb_ltfu"),
+      uiOutput("co_vb_noconsent")
+    ),
+    layout_columns(
+      col_widths = c(3, 3, 3, 3),
+      selectInput("co_outcome", "Outcome", choices = c("All", CLOSEOUT_OUTCOMES), selected = "All"),
+      checkboxInput("co_only_open", "Only those still on a Missing list", value = FALSE),
+      value_box(title = "Total closed out", value = textOutput("co_total"),
+                p(class = "small mb-0", textOutput("co_open_note", inline = TRUE)),
+                showcase = icon("user-xmark"), theme = "secondary"),
+      div(class = "d-flex align-items-center",
+          downloadButton("co_download", "Download close-out list (CSV)"))
+    ),
+    card(
+      card_header("Close-out line list"),
+      DTOutput("closeout_table")
+    )
   )
 )
 
@@ -241,7 +278,9 @@ server <- function(input, output, session) {
     in_range <- !is.na(df$tbrx_start_date) &
       df$tbrx_start_date >= rng[1] & df$tbrx_start_date <= rng[2]
     keep <- in_range | (isTRUE(input$f_tbrx_include_na) & is.na(df$tbrx_start_date))
-    df$study_id[keep]
+    ids <- df$study_id[keep]
+    if (isTRUE(input$f_hide_closed)) ids <- setdiff(ids, live_data()$closeout$study_id)
+    ids
   })
 
   # ---- Home tab header ----
@@ -561,6 +600,102 @@ server <- function(input, output, session) {
         fontWeight = "bold"
       )
   })
+
+  # ---- Close-out tab ----
+  # Open (actually missing, not "Not yet Due") forms per participant
+  open_missing_by_id <- reactive({
+    mf <- live_data()$missing_forms
+    if (nrow(mf) == 0) return(tibble(study_id = character(0), open_n = integer(0), open_forms = character(0)))
+    if (!"expected_at" %in% names(mf)) mf$expected_at <- NA_character_
+    mf %>%
+      filter(!is.na(status), !(status %in% NOT_MISSING_STATUSES)) %>%
+      mutate(label = ifelse(!is.na(expected_at) & form %in% STAGE2_FORMS,
+                            paste0(form, " (", expected_at, ")"), form)) %>%
+      group_by(study_id) %>%
+      summarise(open_n = n(), open_forms = paste(label, collapse = "; "), .groups = "drop")
+  })
+
+  closeout_facility <- reactive({
+    co <- live_data()$closeout
+    if (nrow(co) == 0) return(co %>% mutate(open_n = integer(0), open_forms = character(0)))
+    if (input$f_facility != "All") co <- co %>% filter(facility == input$f_facility)
+    co %>%
+      left_join(open_missing_by_id(), by = "study_id") %>%
+      mutate(open_n = coalesce(open_n, 0L))
+  })
+
+  closeout_filtered <- reactive({
+    co <- closeout_facility()
+    if (nrow(co) == 0) return(co)
+    if (input$co_outcome != "All") co <- co %>% filter(outcome == input$co_outcome)
+    if (isTRUE(input$co_only_open)) co <- co %>% filter(open_n > 0)
+    co
+  })
+
+  co_box <- function(outcome_label, title, icon_name, theme) {
+    renderUI({
+      n <- sum(closeout_facility()$outcome == outcome_label, na.rm = TRUE)
+      value_box(title = title, value = format(n, big.mark = ","),
+                showcase = icon(icon_name), theme = theme)
+    })
+  }
+  output$co_vb_died      <- co_box("Died", "Died", "cross", "dark")
+  output$co_vb_transfer  <- co_box("Transferred out", "Transferred out", "right-from-bracket", "info")
+  output$co_vb_ltfu      <- co_box("Lost to follow-up", "Lost to follow-up", "user-slash", "warning")
+  output$co_vb_noconsent <- co_box("Not consented (>30 days)", "Not consented (>30 days)", "ban", "danger")
+
+  output$co_total <- renderText({
+    format(nrow(closeout_filtered()), big.mark = ",")
+  })
+
+  output$co_open_note <- renderText({
+    co <- closeout_filtered()
+    paste0("Still on a Missing list: ",
+           format(if (nrow(co) == 0) 0 else sum(co$open_n > 0), big.mark = ","))
+  })
+
+  closeout_display <- reactive({
+    co <- closeout_filtered()
+    if (nrow(co) == 0) return(NULL)
+    co %>%
+      arrange(outcome, facility, study_id) %>%
+      transmute(
+        `Study ID` = study_id,
+        Facility = facility,
+        Outcome = outcome,
+        `Recorded At` = recorded_at,
+        `Outcome Date` = format(outcome_date, "%d %b %Y"),
+        `Screening Date` = format(screening_date, "%d %b %Y"),
+        `TB Rx Start Date` = format(tbrx_start_date, "%d %b %Y"),
+        `Open Missing Forms` = open_n,
+        `Forms to Close` = coalesce(open_forms, "")
+      )
+  })
+
+  output$closeout_table <- renderDT({
+    out <- closeout_display()
+    if (is.null(out)) {
+      return(datatable(data.frame(Message = "No closed-out participants match the current filters"), rownames = FALSE))
+    }
+    co_bg <- c("Died" = "#343a40", "Transferred out" = "#17a2b8",
+               "Lost to follow-up" = "#ffc107", "Not consented (>30 days)" = "#dc3545")
+    co_fg <- c("Died" = "white", "Transferred out" = "white",
+               "Lost to follow-up" = "black", "Not consented (>30 days)" = "white")
+    datatable(out, options = list(pageLength = 20, scrollX = TRUE), rownames = FALSE) %>%
+      formatStyle("Outcome",
+                  backgroundColor = styleEqual(names(co_bg), unname(co_bg)),
+                  color = styleEqual(names(co_fg), unname(co_fg)),
+                  fontWeight = "bold")
+  })
+
+  output$co_download <- downloadHandler(
+    filename = function() paste0("TEACH_closeout_", format(Sys.Date(), "%Y%m%d"), ".csv"),
+    content = function(file) {
+      out <- closeout_display()
+      if (is.null(out)) out <- data.frame(Message = "No closed-out participants")
+      write.csv(out, file, row.names = FALSE, na = "")
+    }
+  )
 }
 
 shinyApp(ui, server)
