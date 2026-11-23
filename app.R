@@ -167,7 +167,7 @@ ui <- page_navbar(
     p(class = "text-muted small",
       "Uses the Facility and Treatment Start Date Range filters in the sidebar, plus the filters below. ",
       "Each form has a due date counted from tbrx_start_date (TB refill: start of each period, e.g. 5-6 weeks is due at 5 weeks; ",
-      "Lab: Month 2 and Month 5; ART: monthly). Before the due date a form is Not yet Due; after it, ",
+      "Lab: Month 2 and Month 5; ART Refill: the next appointment date from the latest ART visit). Before the due date a form is Not yet Due; after it, ",
       "Due (0-14 days past due), Almost Overdue (15-30) and Overdue (>30). Total Missing excludes Not yet Due."),
     layout_columns(
       col_widths = c(3, 3, 3, 3),
