@@ -191,7 +191,7 @@ ui <- page_navbar(
       "(1) Died -- recorded anywhere (Dead at Baseline / Month 2 / Month 5 SBQ, passed on before consent, date of death, TB treatment outcome Died); ",
       "(2) Transferred out / Lost to follow-up from participant status, latest visit first (Month 5, Month 2, Baseline); ",
       "(3) Transferred out on any TB refill visit; (4) Transferred out given as reason for not consenting; ",
-      "(5) Not consented -- eligible with no consent 30+ days after screening. ",
+      "(5) Not consented (>30 days) -- reason for refusal recorded as overdue for consent (no consent within 30 days of screening), or eligible with no consent 30+ days after screening. ",
       "Uses the Facility filter only. When 'Hide closed-out participants' is ticked in the sidebar, ",
       "these participants are removed from both Missing tabs."),
     layout_columns(
