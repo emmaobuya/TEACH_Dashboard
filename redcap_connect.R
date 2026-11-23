@@ -26,6 +26,11 @@
 #   - NEW: build_closeout() derives a close-out outcome per participant
 #     (Died / Transferred out / Lost to follow-up / Not consented >30 days).
 #     Missing-form rows carry closeout_outcome so the app can hide them.
+#
+# CHANGE LOG (Nov 2026):
+#   - ART Refill is no longer monthly. It is due on next_appointment from the
+#     participant's latest ART Refill visit (date_visit_art). One row per
+#     participant. Lab and TB schedules are unchanged.
 # ==============================================================================
 
 library(curl)
@@ -84,7 +89,13 @@ redcap_fetch_raw <- function() {
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-blank_to_na <- function(x) ifelse(is.na(x) | x == "", NA, x)
+# Always returns CHARACTER (blank -> NA). The old ifelse() version returned
+# LOGICAL when there were zero rows, which breaks joins (same fix as Q2).
+blank_to_na <- function(x) {
+  x <- as.character(x)
+  x[!is.na(x) & trimws(x) == ""] <- NA_character_
+  x
+}
 
 parse_redcap_date <- function(x) {
   suppressWarnings(as_date(blank_to_na(x)))
@@ -350,19 +361,23 @@ LAB_SCHEDULE <- data.frame(
 )
 LAB_SCHEDULE$seq <- seq_len(nrow(LAB_SCHEDULE))
 
-# ART refill: monthly, from Month 1 up to ART_MAX_MONTHS.
-ART_MAX_MONTHS <- 12
-ART_SCHEDULE <- data.frame(
-  period = paste("Month", seq_len(ART_MAX_MONTHS)),
-  unit   = "months",
-  n      = seq_len(ART_MAX_MONTHS),
-  stringsAsFactors = FALSE
-)
-ART_SCHEDULE$seq <- seq_len(nrow(ART_SCHEDULE))
+# ART refill: NOT monthly. Each ART Refill visit records date_visit_art and
+# next_appointment (set by the clinician). The next refill is due on the
+# next_appointment of the participant's LATEST ART visit (see build_art_missing).
+#   - No ART Refill form yet       -> first refill due ART_FIRST_DUE_MONTHS
+#                                     after tbrx_start_date (as before: Month 1).
+#   - Latest visit has no (valid)  -> due ART_FALLBACK_MONTHS after that visit,
+#     next_appointment                and flagged "No next appointment recorded".
+ART_FIRST_DUE_MONTHS <- 1
+ART_FALLBACK_MONTHS  <- 1
+# TRUE  = only ART forms marked Complete count as a visit.
+# FALSE = any ART form with date_visit_art filled counts (Incomplete/Unverified too).
+ART_COUNT_ONLY_COMPLETE <- FALSE
 
-# Lab and ART forms have no "which timepoint" field, so completed instances
+# Lab forms have no "which timepoint" field, so completed instances
 # are matched to the schedule in order: the 1st complete instance covers the
-# 1st slot (Lab Month 2 / ART Month 1), the 2nd covers the 2nd slot, etc.
+# 1st slot (Lab Month 2), the 2nd covers the 2nd slot, etc. (ART Refill is
+# scheduled from next_appointment instead -- see build_art_missing.)
 count_to_completed_pairs <- function(status_tbl, schedule) {
   done <- status_tbl %>%
     filter(!is.na(complete_flag), complete_flag == "Complete") %>%
@@ -407,6 +422,79 @@ build_scheduled_missing <- function(base, schedule, completed_pairs, form_label)
 }
 
 # ------------------------------------------------------------------------------
+# ART Refill -- scheduled from next_appointment
+# ------------------------------------------------------------------------------
+# One row per ART Refill submission: visit date, next appointment, form status.
+build_art_refill_visits <- function(raw_all) {
+  empty <- tibble(study_id = character(0), complete_flag = character(0),
+                  date_visit_art = as.Date(character(0)),
+                  next_appointment = as.Date(character(0)),
+                  repeat_instance = numeric(0))
+  if (nrow(raw_all) == 0) return(empty)
+  art <- raw_all %>% filter(redcap_repeat_instrument == "Form 7: ART Medication Refill Form")
+  if (nrow(art) == 0) return(empty)
+  tibble(
+    study_id         = as.character(art$study_id),
+    complete_flag    = col_or_na(art, "art_form_complete"),
+    date_visit_art   = parse_redcap_date(col_or_na(art, "date_visit_art")),
+    next_appointment = parse_redcap_date(col_or_na(art, "next_appointment")),
+    repeat_instance  = suppressWarnings(as.numeric(art$redcap_repeat_instance))
+  )
+}
+
+# ONE row per eligible participant: when is their next ART refill due?
+#   due date = next_appointment from their latest ART visit
+#   before the due date -> "Not yet Due" (listed, not counted as missing)
+#   after it            -> Due (0-14d) / Almost Overdue (15-30d) / Overdue (>30d)
+# A participant who came back on or after their appointment has a newer visit,
+# so the clock moves to that visit's next_appointment -- they are not flagged.
+build_art_missing <- function(art_base, art_visits) {
+  if (nrow(art_base) == 0) return(NULL)
+  today <- Sys.Date()
+
+  visits <- art_visits %>% filter(!is.na(date_visit_art))
+  if (ART_COUNT_ONLY_COMPLETE) {
+    visits <- visits %>% filter(!is.na(complete_flag), complete_flag == "Complete")
+  }
+
+  last_visit <- visits %>%
+    arrange(study_id, date_visit_art, repeat_instance) %>%
+    group_by(study_id) %>%
+    slice_tail(n = 1) %>%
+    ungroup() %>%
+    transmute(study_id, last_visit = date_visit_art, last_next_appt = next_appointment)
+
+  art_base %>%
+    select(study_id, facility, tbrx_start_date, calc_days_since_tbrx) %>%
+    mutate(study_id = as.character(study_id)) %>%
+    left_join(last_visit, by = "study_id") %>%
+    mutate(
+      appt_ok  = !is.na(last_visit) & !is.na(last_next_appt) & last_next_appt >= last_visit,
+      due_date = case_when(
+        is.na(last_visit) ~ tbrx_start_date %m+% months(ART_FIRST_DUE_MONTHS),
+        appt_ok           ~ last_next_appt,
+        TRUE              ~ last_visit %m+% months(ART_FALLBACK_MONTHS)
+      ),
+      expected_at = case_when(
+        is.na(last_visit) ~ "First refill (no ART refill form yet)",
+        appt_ok           ~ paste0("Next appointment (last visit ", format(last_visit, "%d %b %Y"), ")"),
+        TRUE              ~ paste0("No next appointment recorded (last visit ",
+                                   format(last_visit, "%d %b %Y"), ")")
+      ),
+      days_past_due = as.numeric(today - due_date),
+      status = if_else(days_past_due < 0, "Not yet Due", classify_3tier(days_past_due))
+    ) %>%
+    filter(!is.na(due_date)) %>%
+    transmute(study_id, facility, form = "ART Refill",
+              reference_date = tbrx_start_date,
+              days_since = calc_days_since_tbrx,
+              status,
+              expected_at,
+              due_date,
+              days_past_due)
+}
+
+# ------------------------------------------------------------------------------
 # Missing Form line list
 # ------------------------------------------------------------------------------
 #  1. Consent      -- eligible & consent blank.        Days since screening.
@@ -414,8 +502,8 @@ build_scheduled_missing <- function(base, schedule, completed_pairs, form_label)
 #  3. Baseline SBQ  -- eligible & consent=Yes & baseline SBQ not Complete. Days since consent.
 #  4. Month 2 SBQ   -- enrolled & baseline SBQ Complete & Month 2 SBQ not Complete. Days since enrollment.
 #  5. Month 5 SBQ   -- same, for the Month 5 ("Month_Six_followup") event.
-#  6-8. Lab / TB Treatment / ART Refill -- scheduled from tbrx_start_date
-#       (see the schedules above).
+#  6-7. Lab / TB Treatment -- scheduled from tbrx_start_date (see schedules above).
+#  8.   ART Refill -- due on next_appointment of the latest ART visit.
 # ------------------------------------------------------------------------------
 build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
                                           lab_status, tb_refill_status, art_refill_status) {
@@ -497,9 +585,8 @@ build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
   # ART Refill: additionally requires HIV positive + on ART
   art_base <- outcomes_base_eligible %>%
     filter(hiv_status == "Positive", started_art == "Yes")
-  art_missing <- build_scheduled_missing(art_base, ART_SCHEDULE,
-                                         count_to_completed_pairs(art_refill_status, ART_SCHEDULE),
-                                         "ART Refill")
+  # art_refill_status here is the visit table from build_art_refill_visits()
+  art_missing <- build_art_missing(art_base, art_refill_status)
 
   tbrx_lookup <- baseline %>%
     select(study_id, tbrx_start_date) %>%
@@ -709,7 +796,7 @@ load_live_data <- function() {
   month5_tbl <- build_followup_sbq(raw, "3. Month_Six_followup")
   lab_tbl <- build_repeat_form_status(raw, "Form 5: Laboratory Tests Form", "laboratory_tests_form_complete")
   tb_refill_tbl <- build_tb_refill_status(raw)
-  art_refill_tbl <- build_repeat_form_status(raw, "Form 7: ART Medication Refill Form", "art_form_complete")
+  art_refill_tbl <- build_art_refill_visits(raw)
 
   closeout_tbl <- build_closeout(raw, baseline_tbl)
 
