@@ -614,7 +614,10 @@ build_missing_form_line_list <- function(baseline, month2_sbq, month5_sbq,
 #  STEP 4  Transferred out -- transfer_out = "Yes" on ANY TB refill visit
 #            (all refill periods, 1-2 weeks through 12 months).
 #  STEP 5  Transferred out -- reason_refusal says "Transferred out".
-#  STEP 6  Not consented -- eligible, consent blank, >30 days since screening.
+#  STEP 6  Not consented (>30 days) -- EITHER reason_refusal says
+#            "Overdue for consent; no consent received within 30 days after
+#            screening" (recorded by staff), OR the dashboard sees eligible,
+#            consent blank and >30 days since screening.
 # ------------------------------------------------------------------------------
 
 CLOSEOUT_OUTCOMES <- c("Died", "Transferred out", "Lost to follow-up",
@@ -633,6 +636,11 @@ first_date <- function(x) {
 is_dead   <- function(x) !is.na(x) & str_detect(x, regex("^\\s*dead", ignore_case = TRUE))
 is_ltfu   <- function(x) !is.na(x) & str_detect(x, regex("lost to follow", ignore_case = TRUE))
 is_tout   <- function(x) !is.na(x) & str_detect(x, regex("transferred out", ignore_case = TRUE))
+# reason_refusal = "Overdue for consent; no consent received within 30 days after screening"
+is_consent_overdue_reason <- function(x) {
+  !is.na(x) & str_detect(x, regex("overdue for consent|no consent received within 30 days",
+                                   ignore_case = TRUE))
+}
 
 # participant_status + dates from one SBQ event, suffixed _bl / _m2 / _m5
 build_event_participant_status <- function(raw_all, event_name, suffix) {
@@ -718,8 +726,11 @@ build_closeout <- function(raw_all, baseline) {
                      !is.na(date_death_consent),
 
       # Step 6
-      consent_overdue = !is.na(eligibility_status) & eligibility_status == "Yes" &
-                        is.na(consent) & !is.na(days_since_screening) & days_since_screening > 30,
+      # recorded by staff in reason_refusal (consent is usually "No" for these)
+      consent_overdue_recorded = is_consent_overdue_reason(reason_refusal),
+      consent_overdue = consent_overdue_recorded |
+                        (!is.na(eligibility_status) & eligibility_status == "Yes" &
+                         is.na(consent) & !is.na(days_since_screening) & days_since_screening > 30),
 
       outcome = case_when(
         died_m5 | died_m2 | died_bl | died_consent | tb_died ~ "Died",
@@ -745,6 +756,7 @@ build_closeout <- function(raw_all, baseline) {
         is_tout(status_bl) | is_ltfu(status_bl) ~ "Baseline SBQ",
         tb_transfer        ~ paste0("TB refill (", tb_transfer_visit, ")"),
         is_tout(reason_refusal) ~ "Consent form",
+        consent_overdue_recorded ~ "Consent form (reason for refusal)",
         consent_overdue    ~ "Screening (no consent in 30 days)",
         TRUE ~ NA_character_
       ),
